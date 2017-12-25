@@ -17,8 +17,7 @@ limitations under the License.
 local rspamd_logger = require 'rspamd_logger'
 local rspamd_http = require "rspamd_http"
 local rspamd_lua_utils = require "lua_util"
-local upstream_list = require "rspamd_upstream_list"
-local N = "clickhouse"
+local rspamd_util = require "rspamd_util"
 
 if confighelp then
   return
@@ -57,12 +56,12 @@ local settings = {
   from_tables = nil,
   enable_symbols = false,
   use_https = false,
-  use_gzip = true,
 }
 
-local clickhouse_schema = {
-rspamd = [[
-CREATE TABLE IF NOT EXISTS rspamd
+--[[
+Clickhouse schema:
+
+CREATE TABLE rspamd
 (
     Date Date,
     TS DateTime,
@@ -79,7 +78,7 @@ CREATE TABLE IF NOT EXISTS rspamd
     IsDkim Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2) DEFAULT CAST('unknown' AS Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2)),
     IsDmarc Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2) DEFAULT CAST('unknown' AS Enum8('reject' = 0, 'allow' = 1, 'unknown' = 2)),
     NUrls Int32,
-    Action Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4, 'soft reject' = 5) DEFAULT CAST('no action' AS Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4, 'soft reject' = 5)),
+    Action Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4) DEFAULT CAST('no action' AS Enum8('reject' = 0, 'rewrite subject' = 1, 'add header' = 2, 'greylist' = 3, 'no action' = 4)),
     FromUser String,
     MimeUser String,
     RcptUser String,
@@ -87,10 +86,8 @@ CREATE TABLE IF NOT EXISTS rspamd
     ListId String,
     Digest FixedString(32)
 ) ENGINE = MergeTree(Date, (TS, From), 8192)
-]],
 
-  attachments = [[
-CREATE TABLE IF NOT EXISTS rspamd_attachments (
+CREATE TABLE rspamd_attachments (
     Date Date,
     Digest FixedString(32),
     `Attachments.FileName` Array(String),
@@ -98,29 +95,23 @@ CREATE TABLE IF NOT EXISTS rspamd_attachments (
     `Attachments.Length` Array(UInt32),
     `Attachments.Digest` Array(FixedString(16))
 ) ENGINE = MergeTree(Date, Digest, 8192)
-]],
 
-  urls = [[
-CREATE TABLE IF NOT EXISTS rspamd_urls (
+CREATE TABLE rspamd_urls (
     Date Date,
     Digest FixedString(32),
     `Urls.Tld` Array(String),
     `Urls.Url` Array(String)
 ) ENGINE = MergeTree(Date, Digest, 8192)
-]],
 
-  asn = [[
-CREATE TABLE IF NOT EXISTS rspamd_asn (
+CREATE TABLE rspamd_asn (
     Date Date,
     Digest FixedString(32),
     ASN String,
     Country FixedString(2),
     IPNet String
 ) ENGINE = MergeTree(Date, Digest, 8192)
-]],
 
-  symbols = [[
-CREATE TABLE IF NOT EXISTS rspamd_symbols (
+CREATE TABLE rspamd_symbols (
     Date Date,
     Digest FixedString(32),
     `Symbols.Names` Array(String),
@@ -128,7 +119,6 @@ CREATE TABLE IF NOT EXISTS rspamd_symbols (
     `Symbols.Options` Array(String)
 ) ENGINE = MergeTree(Date, Digest, 8192)
 ]]
-}
 
 local function clickhouse_main_row(tname)
   local fields = {
@@ -249,28 +239,23 @@ local function clickhouse_check_symbol(task, symbols, need_score)
 end
 
 local function clickhouse_send_data(task)
-  local upstream = settings.upstream:get_upstream_round_robin()
-  local ip_addr = upstream:get_addr():to_string(true)
-
   local function http_cb(err_message, code, _, _)
     if code ~= 200 or err_message then
-      rspamd_logger.errx(task, "cannot send data to clickhouse server %s: %s",
-        ip_addr, err_message)
-      upstream:fail()
+      rspamd_logger.errx(task, "cannot send data to clickhouse server %s: %s:%s",
+        settings['server'], code, err_message)
     else
       rspamd_logger.infox(task, "sent %s rows to clickhouse server %s",
-        settings['limit'], ip_addr)
-      upstream:ok()
+        settings['limit'], settings['server'])
     end
   end
 
   local body = table.concat(rows, ' ')
   if not rspamd_http.request({
       task = task,
-      url = connect_prefix .. ip_addr,
+      url = connect_prefix .. settings['server'],
       body = body,
+      headers = auth_header,
       callback = http_cb,
-      gzip = settings.use_gzip,
       mime_type = 'text/plain',
       timeout = settings['timeout'],
     }) then
@@ -282,8 +267,9 @@ local function clickhouse_send_data(task)
     body = table.concat(attachment_rows, ' ')
     if not rspamd_http.request({
       task = task,
-      url = connect_prefix .. ip_addr,
+      url = connect_prefix .. settings['server'],
       body = body,
+      headers = auth_header,
       callback = http_cb,
       mime_type = 'text/plain',
       timeout = settings['timeout'],
@@ -296,8 +282,9 @@ local function clickhouse_send_data(task)
     body = table.concat(urls_rows, ' ')
     if not rspamd_http.request({
       task = task,
-      url = connect_prefix .. ip_addr,
+      url = connect_prefix .. settings['server'],
       body = body,
+      headers = auth_header,
       callback = http_cb,
       mime_type = 'text/plain',
       timeout = settings['timeout'],
@@ -310,8 +297,9 @@ local function clickhouse_send_data(task)
     body = table.concat(asn_rows, ' ')
     if not rspamd_http.request({
       task = task,
-      url = connect_prefix .. ip_addr,
+      url = connect_prefix .. settings['server'],
       body = body,
+      headers = auth_header,
       callback = http_cb,
       mime_type = 'text/plain',
       timeout = settings['timeout'],
@@ -325,8 +313,9 @@ local function clickhouse_send_data(task)
     body = table.concat(symbols_rows, ' ')
     if not rspamd_http.request({
       task = task,
-      url = connect_prefix .. ip_addr,
+      url = connect_prefix .. settings['server'],
       body = body,
+      headers = auth_header,
       callback = http_cb,
       mime_type = 'text/plain',
       timeout = settings['timeout'],
@@ -341,8 +330,9 @@ local function clickhouse_send_data(task)
       body = table.concat(specific, ' ')
       if not rspamd_http.request({
         task = task,
-        url = connect_prefix .. ip_addr,
+        url = connect_prefix .. settings['server'],
         body = body,
+        headers = auth_header,
         callback = http_cb,
         mime_type = 'text/plain',
         timeout = settings['timeout'],
@@ -582,7 +572,7 @@ local function clickhouse_collect(task)
 
   -- ASN information
   if settings['asn_table'] then
-    local asn, country, ipnet = '--', '--', '--'
+    local asn, country, ipnet = 'unknown', 'unknown', 'unknown'
     local pool = task:get_mempool()
     ret = pool:get_variable("asn")
     if ret then
@@ -590,7 +580,7 @@ local function clickhouse_collect(task)
     end
     ret = pool:get_variable("country")
     if ret then
-      country = ret:sub(1, 2)
+      country = ret
     end
     ret = pool:get_variable("ipnet")
     if ret then
@@ -628,7 +618,7 @@ local function clickhouse_collect(task)
       table.concat(scores_tab, ','),
       table.concat(options_tab, ','))
 
-    table.insert(symbols_rows, elt)
+    table.insert(urls_rows, elt)
   end
 
   nrows = nrows + 1
@@ -652,9 +642,8 @@ if opts then
       settings[k] = v
     end
 
-    if not settings['server'] and not settings['servers'] then
+    if not settings['server'] then
       rspamd_logger.infox(rspamd_config, 'no servers are specified, disabling module')
-      rspamd_lua_utils.disable_module(N, "config")
     else
       settings['from_map'] = rspamd_map_add('clickhouse', 'from_tables',
         'regexp', 'clickhouse specific domains')
@@ -662,61 +651,25 @@ if opts then
         connect_prefix = 'https://'
       end
 
-      settings.upstream = upstream_list.create(rspamd_config,
-        settings['server'] or settings['servers'], 8123)
-
-      if not settings.upstream then
-        rspamd_logger.errx('cannot parse clickhouse address: %s',
-            settings['server'] or settings['servers'])
-        rspamd_lua_utils.disable_module(N, "config")
-        return
+      if settings.auth_data then
+          auth_header = {Authorization = 'Basic ' .. rspamd_util.encode_base64(settings.auth_data)}
+          rspamd_logger.infox(rspamd_config, 'Use auth_data for clickhouse')
+      else
+          auth_header = {}
+          rspamd_logger.infox(rspamd_config, 'Dont use auth_data for clickhouse')
       end
+
 
       clickhouse_first_row()
       rspamd_config:register_symbol({
         name = 'CLICKHOUSE_COLLECT',
-        type = 'idempotent',
+        type = 'postfilter',
         callback = clickhouse_collect,
         priority = 10
       })
       rspamd_config:register_finish_script(function(task)
         if nrows > 0 then
           clickhouse_send_data(task)
-        end
-      end)
-      -- Create tables on load
-      rspamd_config:add_on_load(function(cfg, ev_base, worker)
-        -- XXX: need to call this script for all upstreams
-        local upstream = settings.upstream:get_upstream_round_robin()
-        local ip_addr = upstream:get_addr():to_string(true)
-
-        local function http_cb(err_message, code, _, _)
-          if code ~= 200 or err_message then
-            rspamd_logger.errx(rspamd_config, "cannot create table in clickhouse server %s: %s",
-              ip_addr, err_message)
-            upstream:fail()
-          else
-            upstream:ok()
-          end
-        end
-
-        local function send_req(elt, sql)
-          if not rspamd_http.request({
-            ev_base = ev_base,
-            config = cfg,
-            url = connect_prefix .. ip_addr,
-            body = sql,
-            callback = http_cb,
-            mime_type = 'text/plain',
-            timeout = settings['timeout'],
-          }) then
-            rspamd_logger.errx(rspamd_config, "cannot create table %s in clickhouse server %s: cannot make request",
-              elt, settings['server'])
-          end
-        end
-
-        for tab,sql in pairs(clickhouse_schema) do
-          send_req(tab, sql)
         end
       end)
     end
